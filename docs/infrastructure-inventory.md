@@ -1,4 +1,4 @@
-# Assessment Engine - Infrastructure Map
+# Assessment Engine - Infrastructure Inventory
 
 This document provides a true step-by-step implementation guide for building the AWS infrastructure required for the Dynamic Challenge Assessment Engine. Each step builds upon the previous one, creating a complete system that enables automated assessment of AWS reliability challenges.
 
