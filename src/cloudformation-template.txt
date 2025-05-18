@@ -1,0 +1,743 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Dynamic Challenge Assessment Engine Infrastructure'
+
+Parameters:
+  ChallengeBucketName:
+    Type: String
+    Description: 'Name of the S3 bucket that will store challenge definitions and check functions'
+    Default: 'ctf-reliability-challenges'
+  
+  DeploymentBucketName:
+    Type: String
+    Description: 'Name of the S3 bucket that will store Lambda deployment packages'
+    Default: 'ctf-deployment-bucket'
+  
+  ExternalId:
+    Type: String
+    Description: 'External ID for cross-account role assumption'
+    Default: 'ctf-assessment-engine'
+
+Resources:
+  # -------------- Storage Resources --------------
+  
+  # S3 Bucket for challenge repository
+  ChallengeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref ChallengeBucketName
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+  
+  # S3 Bucket for Lambda deployment packages
+  DeploymentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref DeploymentBucketName
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+  
+  # DynamoDB Table for challenge registry
+  ChallengeRegistryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ctf-challenge-registry
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: challengeId
+          AttributeType: S
+        - AttributeName: active
+          AttributeType: S
+      KeySchema:
+        - AttributeName: challengeId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: active-index
+          KeySchema:
+            - AttributeName: active
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+  
+  # DynamoDB Table for assessment results
+  AssessmentResultsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ctf-assessment-results
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: participantId
+          AttributeType: S
+        - AttributeName: challengeId
+          AttributeType: S
+        - AttributeName: teamId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: participantId
+          KeyType: HASH
+        - AttributeName: challengeId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: team-index
+          KeySchema:
+            - AttributeName: teamId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+  
+  # -------------- IAM Resources --------------
+  
+  # IAM Role for Assessment Engine Lambda
+  AssessmentEngineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AssessmentEngineRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AssessmentEnginePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ChallengeBucket.Arn
+                  - !Sub '${ChallengeBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt ChallengeRegistryTable.Arn
+                  - !GetAtt AssessmentResultsTable.Arn
+                  - !Sub '${ChallengeRegistryTable.Arn}/index/*'
+                  - !Sub '${AssessmentResultsTable.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource: 'arn:aws:iam::*:role/AssessmentEngineAccessRole'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+  
+  # -------------- Lambda Functions --------------
+  
+  # Lambda function for assessment engine
+  AssessmentEngineLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaLogGroup
+    Properties:
+      FunctionName: reliability-assessment-engine
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt AssessmentEngineRole.Arn
+      Code:
+        S3Bucket: !Ref DeploymentBucket
+        S3Key: assessment-engine.zip
+      Timeout: 300
+      MemorySize: 1024
+      Environment:
+        Variables:
+          CHALLENGE_REGISTRY_TABLE: !Ref ChallengeRegistryTable
+          ASSESSMENT_RESULTS_TABLE: !Ref AssessmentResultsTable
+          CHALLENGE_BUCKET: !Ref ChallengeBucket
+          ASSESSMENT_ENGINE_EXTERNAL_ID: !Ref ExternalId
+  
+  # CloudWatch Log Group for Lambda
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/reliability-assessment-engine'
+      RetentionInDays: 30
+  
+  # -------------- API Gateway --------------
+  
+  # API Gateway REST API
+  AssessmentAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: ctf-assessment-api
+      Description: API for the Dynamic Challenge Assessment Engine
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+  
+  # API Gateway Resource for assessments
+  AssessmentsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref AssessmentAPI
+      ParentId: !GetAtt AssessmentAPI.RootResourceId
+      PathPart: assessments
+  
+  # API Gateway Method for assessments
+  AssessmentsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref AssessmentAPI
+      ResourceId: !Ref AssessmentsResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AssessmentEngineLambda.Arn}/invocations'
+  
+  # API Gateway Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - AssessmentsMethod
+    Properties:
+      RestApiId: !Ref AssessmentAPI
+      StageName: prod
+  
+  # Lambda Permission for API Gateway
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AssessmentEngineLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${AssessmentAPI}/*/*/assessments'
+  
+  # -------------- SNS Topics --------------
+  
+  # SNS Topic for alerts
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: ctf-assessment-alerts
+      DisplayName: CTF Assessment Alerts
+  
+  # SNS Subscription for alerts
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: admin@example.com  # Replace with actual email
+  
+  # -------------- CloudWatch Resources --------------
+  
+  # Dashboard for assessment monitoring
+  AssessmentDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: ctf-assessment-dashboard
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "CTF/AssessmentEngine", "AssessmentScore", "ChallengeId", "reliability-voting-system", { "stat": "Average" } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Average Assessment Scores",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "CTF/AssessmentEngine", "AssessmentsPassed", "ChallengeId", "reliability-voting-system", { "stat": "Sum" } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Successful Assessments",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "CTF/AssessmentEngine", "AssessmentDuration", "ChallengeId", "reliability-voting-system", { "stat": "Average" } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Assessment Duration",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "CTF/AssessmentEngine", "AssessmentErrors", "ChallengeId", "reliability-voting-system", { "stat": "Sum" } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Assessment Errors",
+                "period": 300
+              }
+            }
+          ]
+        }
+  
+  # Alarm for assessment errors
+  AssessmentErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: AssessmentEngineErrors
+      AlarmDescription: Alarm for assessment engine errors
+      MetricName: AssessmentErrors
+      Namespace: CTF/AssessmentEngine
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: ChallengeId
+          Value: reliability-voting-system
+      AlarmActions:
+        - !Ref AlertsTopic
+  
+  # Alarm for Lambda function errors
+  LambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: AssessmentEngineLambdaErrors
+      AlarmDescription: Alarm for Lambda function errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: reliability-assessment-engine
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  # -------------- Sample Challenge --------------
+
+  # Custom resource to upload initial sample challenge to S3
+  UploadSampleChallenge:
+    Type: Custom::UploadSampleChallenge
+    DependsOn: ChallengeBucket  # Ensure bucket exists first
+    Properties:
+      ServiceToken: !GetAtt UploadSampleChallengeFunction.Arn
+      ChallengeBucket: !Ref ChallengeBucket
+      ChallengeId: reliability-voting-system
+  
+  # Lambda function to handle sample challenge upload
+  UploadSampleChallengeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt UploadSampleChallengeRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          import os
+          
+          s3 = boto3.client('s3')
+          dynamodb = boto3.resource('dynamodb')
+          
+          def handler(event, context):
+              try:
+                  print(f"Received event: {json.dumps(event)}")
+                  
+                  if event['RequestType'] == 'Delete':
+                      # Handle stack deletion - no need to delete objects
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  bucket_name = event['ResourceProperties']['ChallengeBucket']
+                  challenge_id = event['ResourceProperties']['ChallengeId']
+                  
+                  # Create config.json content
+                  config = {
+                      "challengeId": challenge_id,
+                      "name": "Reliable Voting System",
+                      "description": "Improve a voting system's reliability during peak traffic",
+                      "assessmentCriteria": [
+                          {
+                              "id": "multi-region",
+                              "name": "Multi-Region Deployment",
+                              "points": 10,
+                              "checkFunction": "check_multi_region_deployment"
+                          },
+                          {
+                              "id": "dynamodb-backup",
+                              "name": "DynamoDB Point-in-Time Recovery",
+                              "points": 10,
+                              "checkFunction": "check_dynamodb_backups"
+                          },
+                          {
+                              "id": "error-handling",
+                              "name": "Error Handling & Retry Logic",
+                              "points": 15,
+                              "checkFunction": "check_error_handling"
+                          }
+                      ],
+                      "stackNamePrefix": "reliability-challenge-",
+                      "passingScore": 80
+                  }
+                  
+                  # Create check-functions.py content
+                  check_functions = '''def check_multi_region_deployment(participant_id, stack_name, credentials=None):
+                      import boto3
+                      
+                      # If credentials are provided, use them to create clients
+                      if credentials:
+                          session = boto3.Session(
+                              aws_access_key_id=credentials.get('aws_access_key_id'),
+                              aws_secret_access_key=credentials.get('aws_secret_access_key'),
+                              aws_session_token=credentials.get('aws_session_token')
+                          )
+                      else:
+                          session = boto3.Session()
+                      
+                      # Check for resources in multiple regions
+                      regions = ['us-east-1', 'us-west-2', 'eu-west-1']
+                      deployed_in_regions = []
+                      
+                      for region in regions:
+                          cf = session.client('cloudformation', region_name=region)
+                          try:
+                              stack = cf.describe_stacks(StackName=stack_name)
+                              if stack.get('Stacks'):
+                                  deployed_in_regions.append(region)
+                          except Exception:
+                              # Stack doesn't exist in this region, continue
+                              pass
+                      
+                      # Check for global tables
+                      dynamodb = session.client('dynamodb')
+                      tables = dynamodb.list_tables()
+                      
+                      has_global_tables = False
+                      for table_name in tables.get('TableNames', []):
+                          if participant_id in table_name:
+                              try:
+                                  table = dynamodb.describe_table(TableName=table_name)
+                                  if 'GlobalTableVersion' in table.get('Table', {}):
+                                      has_global_tables = True
+                                      break
+                              except Exception as e:
+                                  print(f"Error checking table {table_name}: {str(e)}")
+                      
+                      return {
+                          "implemented": len(deployed_in_regions) > 1 or has_global_tables,
+                          "details": {
+                              "regions": deployed_in_regions,
+                              "hasGlobalTables": has_global_tables
+                          }
+                      }
+                  
+                  def check_dynamodb_backups(participant_id, stack_name, credentials=None):
+                      import boto3
+                      
+                      # If credentials are provided, use them to create clients
+                      if credentials:
+                          session = boto3.Session(
+                              aws_access_key_id=credentials.get('aws_access_key_id'),
+                              aws_secret_access_key=credentials.get('aws_secret_access_key'),
+                              aws_session_token=credentials.get('aws_session_token')
+                          )
+                      else:
+                          session = boto3.Session()
+                      
+                      dynamodb = session.client('dynamodb')
+                      tables = dynamodb.list_tables()
+                      
+                      # Filter tables associated with the participant
+                      participant_tables = []
+                      for table_name in tables.get('TableNames', []):
+                          if participant_id in table_name or stack_name in table_name:
+                              participant_tables.append(table_name)
+                      
+                      # Check point-in-time recovery for each table
+                      tables_with_pitr = 0
+                      table_details = []
+                      
+                      for table_name in participant_tables:
+                          try:
+                              result = dynamodb.describe_continuous_backups(TableName=table_name)
+                              
+                              has_pitr = (
+                                  result.get('ContinuousBackupsDescription', {})
+                                  .get('PointInTimeRecoveryDescription', {})
+                                  .get('PointInTimeRecoveryStatus') == 'ENABLED'
+                              )
+                              
+                              if has_pitr:
+                                  tables_with_pitr += 1
+                              
+                              table_details.append({
+                                  'tableName': table_name,
+                                  'hasPITR': has_pitr
+                              })
+                          except Exception as e:
+                              print(f"Error checking PITR for table {table_name}: {str(e)}")
+                              table_details.append({
+                                  'tableName': table_name,
+                                  'hasPITR': False,
+                                  'error': str(e)
+                              })
+                      
+                      return {
+                          "implemented": tables_with_pitr > 0 and tables_with_pitr == len(participant_tables),
+                          "details": {
+                              "tablesChecked": len(participant_tables),
+                              "tablesWithPITR": tables_with_pitr,
+                              "tableDetails": table_details
+                          }
+                      }
+                  
+                  def check_error_handling(participant_id, stack_name, credentials=None):
+                      import boto3
+                      
+                      # If credentials are provided, use them to create clients
+                      if credentials:
+                          session = boto3.Session(
+                              aws_access_key_id=credentials.get('aws_access_key_id'),
+                              aws_secret_access_key=credentials.get('aws_secret_access_key'),
+                              aws_session_token=credentials.get('aws_session_token')
+                          )
+                      else:
+                          session = boto3.Session()
+                      
+                      cf = session.client('cloudformation')
+                      lambda_client = session.client('lambda')
+                      
+                      # Get stack resources
+                      try:
+                          resources = cf.list_stack_resources(StackName=stack_name)
+                      except Exception:
+                          return {
+                              "implemented": False,
+                              "details": {
+                                  "error": f"Stack {stack_name} not found"
+                              }
+                          }
+                      
+                      # Look for Lambda functions in the stack
+                      lambda_functions = []
+                      for resource in resources.get('StackResourceSummaries', []):
+                          if resource.get('ResourceType') == 'AWS::Lambda::Function':
+                              lambda_functions.append(resource.get('PhysicalResourceId'))
+                      
+                      # Check Lambda functions for error handling
+                      functions_with_dlq = 0
+                      functions_with_retries = 0
+                      function_details = []
+                      
+                      for function_name in lambda_functions:
+                          try:
+                              # Get Lambda function configuration
+                              function = lambda_client.get_function(FunctionName=function_name)
+                              function_config = function.get('Configuration', {})
+                              
+                              # Check for Dead Letter Queue
+                              has_dlq = 'DeadLetterConfig' in function_config and function_config['DeadLetterConfig'].get('TargetArn')
+                              
+                              # Check for retry attempts
+                              has_retries = False
+                              if 'Environment' in function_config:
+                                  env_vars = function_config['Environment'].get('Variables', {})
+                                  has_retries = 'MAX_RETRIES' in env_vars or 'RETRY_COUNT' in env_vars
+                              
+                              # Update counters
+                              if has_dlq:
+                                  functions_with_dlq += 1
+                              if has_retries:
+                                  functions_with_retries += 1
+                              
+                              function_details.append({
+                                  'functionName': function_name,
+                                  'hasDLQ': has_dlq,
+                                  'hasRetries': has_retries
+                              })
+                          except Exception as e:
+                              print(f"Error checking function {function_name}: {str(e)}")
+                              function_details.append({
+                                  'functionName': function_name,
+                                  'error': str(e)
+                              })
+                      
+                      # Determine if error handling is implemented
+                      has_error_handling = (
+                          len(lambda_functions) > 0 and
+                          functions_with_dlq == len(lambda_functions) and
+                          functions_with_retries > 0
+                      )
+                      
+                      return {
+                          "implemented": has_error_handling,
+                          "details": {
+                              "functionsChecked": len(lambda_functions),
+                              "functionsWithDLQ": functions_with_dlq,
+                              "functionsWithRetries": functions_with_retries,
+                              "functionDetails": function_details
+                          }
+                      }
+                  '''
+                  
+                  # Upload files to S3
+                  s3.put_object(Bucket=bucket_name, Key=f"{challenge_id}/config.json", Body=json.dumps(config))
+                  print(f"Uploaded config.json to s3://{bucket_name}/{challenge_id}/config.json")
+                  
+                  s3.put_object(Bucket=bucket_name, Key=f"{challenge_id}/check-functions.py", Body=check_functions)
+                  print(f"Uploaded check-functions.py to s3://{bucket_name}/{challenge_id}/check-functions.py")
+                  
+                  # Register challenge in DynamoDB
+                  table = dynamodb.Table('ctf-challenge-registry')
+                  
+                  from datetime import datetime
+                  
+                  item = {
+                      'challengeId': challenge_id,
+                      'name': config['name'],
+                      'description': config['description'],
+                      's3Location': f"s3://{bucket_name}/{challenge_id}/",
+                      'configFile': 'config.json',
+                      'checkFunctionsFile': 'check-functions.py',
+                      'difficulty': 'intermediate',
+                      'active': 'true',
+                      'createdBy': 'CloudFormation',
+                      'createdAt': datetime.now().isoformat()
+                  }
+                  
+                  table.put_item(Item=item)
+                  print(f"Registered challenge in DynamoDB: {challenge_id}")
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'Message': f"Successfully uploaded sample challenge {challenge_id}"
+                  })
+              
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {
+                      'Error': str(e)
+                  })
+  
+  # IAM role for sample challenge upload Lambda
+  UploadSampleChallengeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: UploadSampleChallengePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !Sub '${ChallengeBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource:
+                  - !GetAtt ChallengeRegistryTable.Arn
+
+Outputs:
+  ChallengeBucketName:
+    Description: Name of the S3 bucket that stores challenge definitions
+    Value: !Ref ChallengeBucket
+  
+  DeploymentBucketName:
+    Description: Name of the S3 bucket that stores Lambda deployment packages
+    Value: !Ref DeploymentBucket
+  
+  ChallengeRegistryTableName:
+    Description: Name of the DynamoDB table for challenge registry
+    Value: !Ref ChallengeRegistryTable
+  
+  AssessmentResultsTableName:
+    Description: Name of the DynamoDB table for assessment results
+    Value: !Ref AssessmentResultsTable
+  
+  LambdaFunctionName:
+    Description: Name of the assessment engine Lambda function
+    Value: !Ref AssessmentEngineLambda
+  
+  LambdaFunctionArn:
+    Description: ARN of the assessment engine Lambda function
+    Value: !GetAtt AssessmentEngineLambda.Arn
+  
+  ApiUrl:
+    Description: URL of the API Gateway endpoint
+    Value: !Sub 'https://${AssessmentAPI}.execute-api.${AWS::Region}.amazonaws.com/prod/assessments'
+  
+  AlertsTopicArn:
+    Description: ARN of the SNS topic for alerts
+    Value: !Ref AlertsTopic
