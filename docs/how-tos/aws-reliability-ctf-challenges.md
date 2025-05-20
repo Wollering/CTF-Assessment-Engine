@@ -64,5 +64,3 @@ For effective implementation of these CTF challenges, each challenge should incl
 - **Load Testing**: For challenges focused on handling load, include mechanisms to generate realistic load patterns.
 
 - **Chaos Testing**: For advanced challenges, include controlled chaos experiments to verify resilience improvements.
-
-By following these recommendations, you can create engaging, educational CTF challenges that effectively teach AWS Well-Architected Reliability principles through hands-on problem-solving.
