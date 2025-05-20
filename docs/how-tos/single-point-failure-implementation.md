@@ -549,7 +549,9 @@ Provide helpful resources for participants:
 ```
 
 ## Integration with CTF Platform
-
+NOTE: REFER TO DOCUMENTATION IN "Challenge Management API" and the "CLI Tool Documentation".  The API is used by both the assessment engine and the 
+      CLI tool.
+      
 To integrate this challenge with the Dynamic Challenge Assessment Engine:
 
 1. Store challenge configuration in S3:
