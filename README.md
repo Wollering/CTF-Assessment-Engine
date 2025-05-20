@@ -135,6 +135,8 @@ aws cloudformation describe-stacks \
 
 ### Creating a New Challenge
 
+For detailed instructions on creating a new challenge, see documentation in ../docs/how-tos
+
 1. Create a directory for your challenge:
 
 ```bash
